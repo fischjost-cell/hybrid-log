@@ -239,7 +239,7 @@ td.num, th.num { text-align: right; }
   <header class="top">
     <div class="brand-row">
       <h1>Hybrid Log</h1>
-      <span class="status" id="status" data-mode="init">Lädt …</span>
+      <a class="status" id="status" data-mode="init" href="#verlauf" style="text-decoration:none">Lädt …</a>
     </div>
     <nav class="tabs" aria-label="Ansichten">
       <a href="#woche" data-view="woche">Woche</a>
@@ -326,7 +326,7 @@ td.num, th.num { text-align: right; }
     <section id="view-verlauf" aria-label="Verlauf" hidden>
       <h2>Wochenlast, letzte 8 Wochen</h2>
       <div class="chart-card">
-        <div class="legend"><span><i style="background:var(--accent)"></i>Ausdauer</span><span><i style="background:var(--strength)"></i>Kraft &amp; Athletik</span><span>in AU (RPE × min)</span></div>
+        <div class="legend"><span><i style="background:var(--accent)"></i>Ausdauer</span><span><i style="background:var(--strength)"></i>Kraft &amp; Athletik</span><span>in AU (RPE × min) je Kalenderwoche</span></div>
         <div class="chart" id="chart"></div>
         <div class="tip" id="tip" hidden></div>
         <details><summary>Als Tabelle</summary><div class="tbl-wrap" id="chart-table"></div></details>
@@ -335,9 +335,35 @@ td.num, th.num { text-align: right; }
       <div class="list tbl-wrap" id="strength-table"></div>
       <h2>Letzte Einheiten</h2>
       <div class="list" id="recent"></div>
+      <h2 id="sync">Synchronisierung</h2>
+      <div class="backup" id="sync-box">
+        <div id="sync-off">
+          <p>Verbinde die App mit deinem Supabase-Projekt, dann sind iPhone und Computer immer auf demselben Stand. Auf dem zweiten Gerät reicht der Verbindungscode.</p>
+          <form id="sync-form" novalidate style="gap:10px;margin-top:10px">
+            <label class="field"><span>Projekt-URL oder Verbindungscode</span><input type="text" id="s-url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://xxxx.supabase.co oder HL1:…"></label>
+            <label class="field" id="s-key-field"><span>Publishable Key (oder anon key)</span><input type="text" id="s-key" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sb_publishable_… oder eyJ…"></label>
+            <label class="field"><span>E-Mail</span><input type="text" id="s-email" inputmode="email" autocomplete="username" autocapitalize="off" spellcheck="false"></label>
+            <label class="field"><span>Passwort</span><input type="password" id="s-pass" autocomplete="current-password"></label>
+            <p class="error" id="sync-error" hidden></p>
+            <div class="row-btns"><button type="submit" class="btn" id="s-connect">Verbinden</button></div>
+          </form>
+        </div>
+        <div id="sync-on" hidden>
+          <p id="sync-who"></p>
+          <p class="item-meta" id="sync-meta"></p>
+          <p class="error" id="sync-err-on" hidden></p>
+          <div class="row-btns">
+            <button type="button" class="btn" id="s-now">Jetzt synchronisieren</button>
+            <button type="button" class="btn ghost" id="s-code">Code für weiteres Gerät</button>
+            <button type="button" class="btn ghost" id="s-off">Abmelden</button>
+          </div>
+          <input type="text" id="s-code-out" readonly hidden aria-label="Verbindungscode">
+        </div>
+      </div>
+
       <h2>Daten &amp; Sicherung</h2>
       <div class="backup">
-        <p>Deine Einheiten liegen nur auf diesem Gerät. Speichere regelmäßig ein Backup in iCloud Drive – damit kannst du sie auf einem neuen Handy oder nach dem Löschen der App wiederherstellen.</p>
+        <p>Ein Backup in iCloud Drive schützt deine Einheiten zusätzlich – ohne Synchronisierung ist es die einzige Kopie außerhalb dieses Geräts.</p>
         <p class="item-meta" id="backup-info"></p>
         <div class="row-btns">
           <button type="button" class="btn" id="backup-save">Backup speichern</button>
@@ -405,49 +431,153 @@ td.num, th.num { text-align: right; }
   let weekStart = mondayOf(new Date());
   let form = null; // { id, plannedKey, sport, exercises: [{name, sets:[{reps,kg,rir}]}] }
 
-  /* ---------- Speicher ---------- */
-  const store = { mode: 'init', col: null };
+  /* ---------- Speicher (lokal, offline-first) ---------- */
   const LS_KEY = 'hybridlog.sessions.v1';
-  let mem = null; // Fallback, falls auch localStorage gesperrt ist
+  const DIRTY_KEY = 'hybridlog.dirty.v1';
+  const SYNC_KEY = 'hybridlog.sync.v1';
+  let mem = null; // Fallback, falls localStorage gesperrt ist
   function lsRead() { if (mem) return mem.slice(); try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch (e) { return []; } }
   function lsWrite(arr) { mem = arr.slice(); try { localStorage.setItem(LS_KEY, JSON.stringify(arr)); } catch (e) {} }
+  const visible = arr => arr.filter(s => s && !s.deleted);
+  function getJSON(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
+  function setJSON(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function markDirty(ids) { const d = new Set(getJSON(DIRTY_KEY, [])); ids.forEach(i => d.add(i)); setJSON(DIRTY_KEY, [...d]); }
+  const newId = () => 'l' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
   function setStatus(mode, text) { const el = document.getElementById('status'); el.dataset.mode = mode; el.textContent = text; }
 
   async function initStore() {
-    let db = null;
-    try { db = (window.claude && window.claude.use) ? await window.claude.use('db') : null; } catch (e) { db = null; }
-    if (db) {
-      store.mode = 'db'; store.col = db.collection('sessions');
-      setStatus('db', 'Synchronisiert');
-      store.col.onSnapshot(snap => {
-        sessions = snap.docs.map(d => Object.assign({ id: d.id }, d.data()));
-        renderAll();
-      }, err => {
-        setStatus('local', 'Verbindung unterbrochen – neu laden');
-      });
-    } else {
-      store.mode = 'local';
-      setStatus('device', 'Auf diesem Gerät gespeichert');
-      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
-      sessions = lsRead();
-      renderAll();
-    }
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+    sessions = visible(lsRead());
+    renderAll();
+    Sync.start();
   }
   async function saveSession(id, data) {
-    if (store.mode === 'db') {
-      if (id) await store.col.doc(id).set(data); else await store.col.add(data);
-    } else {
-      const arr = lsRead();
-      if (id) { const i = arr.findIndex(s => s.id === id); if (i >= 0) arr[i] = Object.assign({ id }, data); else arr.push(Object.assign({ id }, data)); }
-      else arr.push(Object.assign({ id: 'l' + Date.now() }, data));
-      lsWrite(arr); sessions = arr; renderAll();
-    }
+    const arr = lsRead(); id = id || newId();
+    const rec = Object.assign({}, data, { id, updatedAt: Date.now() });
+    delete rec.deleted;
+    const i = arr.findIndex(s => s.id === id); if (i >= 0) arr[i] = rec; else arr.push(rec);
+    lsWrite(arr); markDirty([id]); sessions = visible(arr); renderAll(); Sync.soon();
   }
   async function deleteSession(id) {
-    if (store.mode === 'db') await store.col.doc(id).delete();
-    else { const arr = lsRead().filter(s => s.id !== id); lsWrite(arr); sessions = arr; renderAll(); }
+    const arr = lsRead(); const tomb = { id, deleted: true, updatedAt: Date.now() };
+    const i = arr.findIndex(s => s.id === id); if (i >= 0) arr[i] = tomb; else arr.push(tomb);
+    lsWrite(arr); markDirty([id]); sessions = visible(arr); renderAll(); Sync.soon();
   }
+
+  /* ---------- Synchronisierung (Supabase) ---------- */
+  const Sync = (() => {
+    let cfg = getJSON(SYNC_KEY, null); // {url,key,email,access,refresh,exp,lastPull,lastSync,error}
+    let running = false, again = false, soonT = null, started = false;
+    const save = () => setJSON(SYNC_KEY, cfg);
+    const enabled = () => !!(cfg && cfg.url && cfg.key && cfg.refresh);
+    const pending = () => getJSON(DIRTY_KEY, []).length;
+    const hhmm = t => { const d = new Date(t); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+
+    function showStatus(busy) {
+      if (!enabled()) { setStatus('device', 'Nur auf diesem Gerät'); }
+      else if (busy) setStatus('init', 'Synchronisiere …');
+      else if (cfg.error) setStatus('local', 'Sync-Fehler – siehe Verlauf');
+      else if (!navigator.onLine) setStatus('local', 'Offline' + (pending() ? ' · ' + pending() + ' ausstehend' : ''));
+      else setStatus('db', 'Synchronisiert' + (cfg.lastSync ? ' ' + hhmm(cfg.lastSync) : ''));
+      renderSyncUI();
+    }
+    function errText(e) {
+      if (!e) return 'Unbekannter Fehler';
+      if (e.name === 'TypeError') return 'Supabase nicht erreichbar. Prüfe die Projekt-URL und deine Verbindung.';
+      if (e.status === 400 && /invalid/i.test(e.message)) return 'E-Mail oder Passwort falsch.';
+      if (e.status === 404 || /relation .* does not exist|could not find the table/i.test(e.message)) return 'Tabelle „sessions“ fehlt. Führe das SQL aus der Anleitung in Supabase aus.';
+      if (e.status === 401 || e.status === 403) return 'Zugriff verweigert (' + e.status + '). Melde dich neu an oder prüfe, ob das SQL vollständig ausgeführt wurde.';
+      return e.message || ('Fehler ' + (e.status || ''));
+    }
+    async function httpErr(res) {
+      let j = {}; try { j = await res.json(); } catch (x) {}
+      const e = new Error(j.error_description || j.msg || j.message || j.error || ('HTTP ' + res.status)); e.status = res.status; return e;
+    }
+    async function token(grant, body) {
+      const res = await fetch(cfg.url + '/auth/v1/token?grant_type=' + grant, { method: 'POST', headers: { apikey: cfg.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!res.ok) throw await httpErr(res);
+      const j = await res.json();
+      cfg.access = j.access_token; cfg.refresh = j.refresh_token || cfg.refresh;
+      cfg.exp = Date.now() + (Number(j.expires_in) || 3600) * 1000; save();
+    }
+    async function ensureToken(force) { if (force || !cfg.access || Date.now() > (cfg.exp || 0) - 120000) await token('refresh_token', { refresh_token: cfg.refresh }); }
+    async function api(path, opts) {
+      opts = opts || {};
+      const go = () => fetch(cfg.url + path, Object.assign({}, opts, { headers: Object.assign({ apikey: cfg.key, Authorization: 'Bearer ' + cfg.access, 'Content-Type': 'application/json' }, opts.headers || {}) }));
+      let res = await go();
+      if (res.status === 401) { await ensureToken(true); res = await go(); }
+      if (!res.ok) throw await httpErr(res);
+      return res;
+    }
+
+    async function run() {
+      if (!enabled()) { showStatus(); return; }
+      if (!navigator.onLine) { showStatus(); return; }
+      if (running) { again = true; return; }
+      running = true; showStatus(true);
+      try {
+        await ensureToken();
+        const arr = lsRead(); const dirty = new Set(getJSON(DIRTY_KEY, []));
+        let since = cfg.lastPull || 0, changed = false;
+        // 1) Holen: alles, was der Server seit dem letzten Abgleich bekommen hat
+        for (;;) {
+          const res = await api('/rest/v1/sessions?select=id,data,updated_at,deleted,server_ts&server_ts=gt.' + since + '&order=server_ts.asc&limit=500');
+          const rows = await res.json();
+          rows.forEach(r => {
+            since = Math.max(since, Number(r.server_ts) || 0);
+            const ts = Number(r.updated_at) || 0;
+            const i = arr.findIndex(s => s.id === r.id), local = i >= 0 ? arr[i] : null;
+            if (local && (local.updatedAt || 0) > ts) return; // lokale Änderung ist neuer
+            const rec = r.deleted ? { id: r.id, deleted: true, updatedAt: ts } : Object.assign({}, r.data || {}, { id: r.id, updatedAt: ts });
+            if (i >= 0) arr[i] = rec; else arr.push(rec);
+            dirty.delete(r.id); changed = true;
+          });
+          if (rows.length < 500) break;
+        }
+        // 2) Senden: lokale Änderungen
+        const out = arr.filter(s => dirty.has(s.id)).map(s => {
+          const d = Object.assign({}, s); delete d.id; delete d.deleted; delete d.updatedAt;
+          return { id: s.id, data: s.deleted ? {} : d, updated_at: s.updatedAt || Date.now(), deleted: !!s.deleted };
+        });
+        for (let k = 0; k < out.length; k += 200) {
+          await api('/rest/v1/sessions?on_conflict=id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(out.slice(k, k + 200)) });
+        }
+        out.forEach(o => dirty.delete(o.id));
+        if (changed) lsWrite(arr);
+        setJSON(DIRTY_KEY, [...dirty]);
+        cfg.lastPull = since; cfg.lastSync = Date.now(); cfg.error = null; save();
+        if (changed) { sessions = visible(arr); renderAll(); }
+      } catch (e) {
+        cfg.error = errText(e); save();
+      } finally {
+        running = false; showStatus();
+        if (again) { again = false; setTimeout(run, 400); }
+      }
+    }
+    async function connect(url, key, email, password) {
+      url = String(url || '').trim().replace(/\/+$/, ''); key = String(key || '').trim();
+      if (!/^(https:\/\/.+|http:\/\/localhost(:\d+)?)$/.test(url) && !/^https:\/\/.+/.test(url)) throw new Error('Bitte die Projekt-URL eintragen, z. B. https://abcd.supabase.co');
+      if (!key) throw new Error('Bitte den Publishable- bzw. anon-Key eintragen.');
+      cfg = { url, key, email: String(email || '').trim(), lastPull: 0 };
+      try { await token('password', { email: cfg.email, password }); }
+      catch (e) { const msg = errText(e); cfg = null; try { localStorage.removeItem(SYNC_KEY); } catch (x) {} throw new Error(msg); }
+      markDirty(lsRead().map(s => s.id)); // beim ersten Verbinden alles hochladen
+      save(); await run(); start();
+    }
+    function disconnect() { cfg = null; try { localStorage.removeItem(SYNC_KEY); } catch (e) {} showStatus(); }
+    function soon() { if (!enabled()) { showStatus(); return; } clearTimeout(soonT); soonT = setTimeout(run, 1200); }
+    function start() {
+      showStatus();
+      if (started) { run(); return; }
+      started = true; run();
+      setInterval(() => { if (document.visibilityState === 'visible') run(); }, 60000);
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') run(); });
+      window.addEventListener('online', run); window.addEventListener('offline', () => showStatus());
+    }
+    const info = () => cfg ? { url: cfg.url, key: cfg.key, email: cfg.email, lastSync: cfg.lastSync, error: cfg.error, pending: pending() } : null;
+    return { run, soon, start, connect, disconnect, enabled, info };
+  })();
 
   /* ---------- Hilfen ---------- */
   const byDateDesc = (a, b) => (b.date || '').localeCompare(a.date || '') || (b.updatedAt || 0) - (a.updatedAt || 0);
@@ -803,7 +933,7 @@ td.num, th.num { text-align: right; }
         : `<path d="${topRounded(x, y(w.end), barW, hE, 4)}" fill="var(--accent)"/>`;
       if (hS > 0) bars += `<path d="${topRounded(x, y(w.end + w.str), barW, Math.max(0, hS - gap), 4)}" fill="var(--strength)"/>`;
       const cur = i === weeks.length - 1;
-      bars += `<text x="${cx}" y="${H - 8}" text-anchor="middle"${cur ? ' style="fill:var(--fg);font-weight:600"' : ''}>KW ${w.kw}</text>`;
+      bars += `<text x="${cx}" y="${H - 8}" text-anchor="middle"${cur ? ' style="fill:var(--fg);font-weight:600"' : ''}>${bw < 52 ? '' : 'KW '}${w.kw}</text>`;
       hits += `<rect x="${L + bw * i}" y="${T}" width="${bw}" height="${ih}" fill="transparent" data-i="${i}"/>`;
     });
     $('chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Wochenlast der letzten 8 Wochen, gestapelt nach Ausdauer und Kraft">${g}${bars}<line x1="${L}" x2="${W - R}" y1="${y(0)}" y2="${y(0)}" stroke="var(--muted)" stroke-width="1"/>${hits}</svg>`;
@@ -1025,6 +1155,43 @@ td.num, th.num { text-align: right; }
   ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, () => drop.classList.remove('over')));
   drop.addEventListener('drop', e => { e.preventDefault(); readFile(e.dataTransfer && e.dataTransfer.files[0]); });
 
+  /* ---------- Sync-Oberfläche ---------- */
+  function renderSyncUI() {
+    const inf = Sync.info(), on = !!(inf && Sync.enabled());
+    const off = $('sync-off'), onBox = $('sync-on'); if (!off) return;
+    off.hidden = on; onBox.hidden = !on;
+    if (on) {
+      $('sync-who').textContent = 'Verbunden als ' + (inf.email || '–');
+      const t = inf.lastSync ? new Date(inf.lastSync) : null;
+      $('sync-meta').textContent = (t ? 'Zuletzt abgeglichen ' + dm(t) + ' ' + pad(t.getHours()) + ':' + pad(t.getMinutes()) : 'Noch nicht abgeglichen') + (inf.pending ? ' · ' + inf.pending + ' Änderung(en) ausstehend' : ' · alles aktuell');
+      $('sync-err-on').textContent = inf.error || ''; $('sync-err-on').hidden = !inf.error;
+    }
+  }
+  function parseCode(v) {
+    const m = String(v || '').trim().match(/^HL1:([A-Za-z0-9+/=_-]+)$/); if (!m) return null;
+    try { const o = JSON.parse(decodeURIComponent(escape(atob(m[1].replace(/-/g, '+').replace(/_/g, '/'))))); return o && o.u && o.k ? o : null; } catch (e) { return null; }
+  }
+  $('s-url').addEventListener('input', () => { const c = parseCode($('s-url').value); $('s-key-field').hidden = !!c; });
+  $('sync-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const err = $('sync-error'); err.hidden = true;
+    const c = parseCode($('s-url').value);
+    const url = c ? c.u : $('s-url').value, key = c ? c.k : $('s-key').value;
+    const btn = $('s-connect'); btn.disabled = true; btn.textContent = 'Verbinde …';
+    try { await Sync.connect(url, key, $('s-email').value, $('s-pass').value); $('s-pass').value = ''; toast('Verbunden'); }
+    catch (x) { err.textContent = x.message; err.hidden = false; }
+    finally { btn.disabled = false; btn.textContent = 'Verbinden'; renderSyncUI(); }
+  });
+  $('s-now').addEventListener('click', () => Sync.run());
+  $('s-off').addEventListener('click', () => { Sync.disconnect(); toast('Abgemeldet – Daten bleiben auf dem Gerät'); });
+  $('s-code').addEventListener('click', async () => {
+    const inf = Sync.info(); if (!inf) return;
+    const code = 'HL1:' + btoa(unescape(encodeURIComponent(JSON.stringify({ u: inf.url, k: inf.key }))));
+    const out = $('s-code-out'); out.value = code; out.hidden = false;
+    try { await navigator.clipboard.writeText(code); toast('Code kopiert – auf dem anderen Gerät einfügen'); }
+    catch (e) { out.focus(); out.select(); toast('Code markiert – kopieren und auf dem anderen Gerät einfügen'); }
+  });
+
   /* ---------- Sicherung ---------- */
   const BK_KEY = 'hybridlog.lastBackup';
   function renderBackupInfo() {
@@ -1033,7 +1200,7 @@ td.num, th.num { text-align: right; }
     $('backup-info').textContent = `${n} ${n === 1 ? 'Einheit' : 'Einheiten'} gespeichert · ` + (last ? 'letztes Backup ' + dm(parseISO(last.slice(0, 10))) + last.slice(0, 4) : 'noch kein Backup');
   }
   $('backup-save').addEventListener('click', async () => {
-    const payload = JSON.stringify({ format: 'hybridlog-backup-v1', exportedAt: new Date().toISOString(), sessions: lsRead() }, null, 1);
+    const payload = JSON.stringify({ format: 'hybridlog-backup-v1', exportedAt: new Date().toISOString(), sessions: visible(lsRead()) }, null, 1);
     const name = 'hybrid-log-backup-' + iso(new Date()) + '.json';
     const mark = () => { try { localStorage.setItem(BK_KEY, iso(new Date())); } catch (e) {} renderBackupInfo(); };
     try {
@@ -1052,14 +1219,14 @@ td.num, th.num { text-align: right; }
       let obj; try { obj = JSON.parse(String(fr.result || '')); } catch (x) { toast('Datei ist kein gültiges Backup'); return; }
       const incoming = obj && obj.format === 'hybridlog-backup-v1' && Array.isArray(obj.sessions) ? obj.sessions : null;
       if (!incoming) { toast('Datei ist kein Hybrid-Log-Backup'); return; }
-      const arr = lsRead(); let added = 0, updated = 0;
+      const arr = lsRead(); let added = 0, updated = 0; const touched = [];
       incoming.forEach(s => {
         if (!s || !s.id || !s.date) return;
         const i = arr.findIndex(x => x.id === s.id);
-        if (i < 0) { arr.push(s); added++; }
-        else if ((s.updatedAt || 0) > (arr[i].updatedAt || 0)) { arr[i] = s; updated++; }
+        if (i < 0) { arr.push(s); added++; touched.push(s.id); }
+        else if ((s.updatedAt || 0) > (arr[i].updatedAt || 0)) { arr[i] = s; updated++; touched.push(s.id); }
       });
-      lsWrite(arr); sessions = arr; renderAll();
+      lsWrite(arr); markDirty(touched); sessions = visible(arr); renderAll(); Sync.soon();
       toast(`${added} neu, ${updated} aktualisiert`);
       e.target.value = '';
     };
@@ -1068,11 +1235,13 @@ td.num, th.num { text-align: right; }
 
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     window.addEventListener('load', () => { navigator.serviceWorker.register('sw.js').catch(() => {}); });
+    let swReloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (swReloaded || !navigator.serviceWorker.controller) return; swReloaded = true; location.reload(); });
   }
 
   /* ---------- Start ---------- */
   function renderAll() {
-    renderWeek(); renderHistory(); renderBackupInfo();
+    renderWeek(); renderHistory(); renderBackupInfo(); renderSyncUI();
     if (form && currentView() === 'loggen') fillDatalist();
   }
   renderAll();
