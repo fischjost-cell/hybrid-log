@@ -306,20 +306,26 @@ td.num, th.num { text-align: right; }
 
     <!-- GARMIN -->
     <section id="view-garmin" aria-label="Garmin-Import" hidden>
-      <h2>Garmin-Import</h2>
+      <h2>Garmin automatisch</h2>
+      <div class="backup" id="auto-box">
+        <p id="auto-state"><b>Wird geprüft …</b></p>
+        <p class="item-meta" id="auto-info"></p>
+      </div>
+      <p class="foot" style="margin-top:8px">Einmalig am Mac <b>garmin_setup.sh</b> aus dem Ordner „Hybrid Log“ starten. Danach holt dein Mac alle 2 Stunden neue Aktivitäten, solange er an ist, und die App übernimmt sie beim nächsten Abgleich auf allen Geräten. Läuft bereits eine Einheit mit gleichem Datum und gleicher Sportart, ergänzt die App dort nur Puls, Distanz und Startzeit.</p>
+
+      <h2>Manuell importieren</h2>
       <ol class="steps">
-        <li>Am Mac im Terminal das Sync-Skript starten: <b>python3</b>, Leerzeichen, dann <b>garmin_sync.py</b> aus dem Ordner „Hybrid Log“ ins Fenster ziehen, Enter.</li>
-        <li>Das Skript holt die letzten 60 Tage direkt über deinen Garmin-API-Schlüssel und legt <b>garmin-aktivitaeten.json</b> daneben ab.</li>
-        <li>Am iPhone hier „Garmin-Datei wählen“ → Dateien → iCloud Drive → Claude Cowork Arbeitsordner → Hybrid Log. Bereits importierte Einheiten werden übersprungen.</li>
+        <li>Nur nötig ohne automatischen Import: connect.garmin.com → Aktivitäten → Alle Aktivitäten → „CSV exportieren“.</li>
+        <li>Die Datei hier auswählen. Bereits importierte Einheiten werden übersprungen.</li>
       </ol>
       <label class="drop" id="drop">
         <input type="file" id="f-csv" accept=".json,application/json,.csv,text/csv,text/plain" aria-label="Garmin-Datei auswählen">
         <b>Garmin-Datei wählen</b>
-        <span>garmin-aktivitaeten.json aus dem Skript · oder Activities.csv aus Garmin Connect</span>
+        <span>Activities.csv aus Garmin Connect · oder eine Garmin-JSON-Datei</span>
       </label>
       <p class="error" id="imp-error" hidden></p>
       <div id="imp-preview"></div>
-      <p class="foot">Die Datei wird nur in deinem Browser gelesen. Gespeichert werden Datum, Startzeit, Sportart, Titel, Dauer, Distanz, Puls und Höhenmeter. Fehlt das RPE, trage es nach – erst dann zählt die Einheit in die Wochenlast. Ohne Skript geht es auch per Hand: connect.garmin.com → Aktivitäten → Alle Aktivitäten → „CSV exportieren“.</p>
+      <p class="foot">Die Datei wird nur in deinem Browser gelesen. Gespeichert werden Datum, Startzeit, Sportart, Titel, Dauer, Distanz, Puls und Höhenmeter. Fehlt das RPE, trage es nach – erst dann zählt die Einheit in die Wochenlast.</p>
     </section>
 
     <!-- VERLAUF -->
@@ -535,6 +541,42 @@ td.num, th.num { text-align: right; }
           });
           if (rows.length < 500) break;
         }
+        // 1b) Garmin-Rohdaten (vom Mac-Skript) in Einheiten umwandeln
+        let rawSince = cfg.lastRaw || 0, gAdded = 0, gMerged = 0;
+        try {
+          const taken = new Set();
+          for (;;) {
+            const res = await api('/rest/v1/garmin_raw?select=id,data,server_ts&server_ts=gt.' + rawSince + '&order=server_ts.asc&limit=500');
+            const rows = await res.json();
+            rows.forEach(r => {
+              rawSince = Math.max(rawSince, Number(r.server_ts) || 0);
+              const g = normGarmin(r.data || {}); if (!g || !g.sport) return;
+              const known = arr.some(s => s.id === g.id || s.garminId === g.id ||
+                (s.source === 'garmin' && !s.deleted && s.date === g.date && s.startTime && s.startTime.slice(0, 5) === g.time.slice(0, 5)));
+              if (known) return;
+              const manual = arr.find(s => !s.deleted && !s.garminId && s.source !== 'garmin' && s.date === g.date && s.sport === g.sport);
+              if (manual) { // manuell geloggt: nur Garmin-Werte ergänzen
+                Object.assign(manual, {
+                  garminId: g.id, startTime: manual.startTime || g.time, avgHr: manual.avgHr || g.avgHr, maxHr: manual.maxHr || g.maxHr,
+                  ascent: manual.ascent || g.ascent, distanceKm: manual.distanceKm || (SPORTS[g.sport].endurance ? g.distanceKm : null), updatedAt: Date.now()
+                });
+                dirty.add(manual.id); changed = true; gMerged++; return;
+              }
+              arr.push({
+                id: g.id, date: g.date, sport: g.sport, title: g.title, duration: g.duration,
+                rpe: g.rpe, load: g.rpe ? Math.round(g.rpe * g.duration) : null,
+                distanceKm: SPORTS[g.sport].endurance ? g.distanceKm : null, notes: '', exercises: null,
+                plannedKey: autoPlanKey(g.date, g.sport, taken, arr), source: 'garmin', garminId: g.id, startTime: g.time,
+                avgHr: g.avgHr, maxHr: g.maxHr, ascent: g.ascent, updatedAt: Date.now()
+              });
+              dirty.add(g.id); changed = true; gAdded++;
+            });
+            if (rows.length < 500) break;
+          }
+          cfg.rawMissing = false;
+        } catch (e) {
+          if (e && (e.status === 404 || /garmin_raw/.test(e.message || ''))) cfg.rawMissing = true; else throw e;
+        }
         // 2) Senden: lokale Änderungen
         const out = arr.filter(s => dirty.has(s.id)).map(s => {
           const d = Object.assign({}, s); delete d.id; delete d.deleted; delete d.updatedAt;
@@ -546,8 +588,11 @@ td.num, th.num { text-align: right; }
         out.forEach(o => dirty.delete(o.id));
         if (changed) lsWrite(arr);
         setJSON(DIRTY_KEY, [...dirty]);
-        cfg.lastPull = since; cfg.lastSync = Date.now(); cfg.error = null; save();
+        cfg.lastPull = since; cfg.lastRaw = rawSince; cfg.lastSync = Date.now(); cfg.error = null;
+        if (gAdded || gMerged) cfg.lastGarmin = { added: gAdded, merged: gMerged, at: Date.now() };
+        save();
         if (changed) { sessions = visible(arr); renderAll(); }
+        if (gAdded || gMerged) toast(gAdded ? `${gAdded} Garmin-${gAdded === 1 ? 'Einheit' : 'Einheiten'} übernommen – RPE nachtragen` : `Garmin-Daten zu ${gMerged} Einheit(en) ergänzt`);
       } catch (e) {
         cfg.error = errText(e); save();
       } finally {
@@ -575,7 +620,7 @@ td.num, th.num { text-align: right; }
       document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') run(); });
       window.addEventListener('online', run); window.addEventListener('offline', () => showStatus());
     }
-    const info = () => cfg ? { url: cfg.url, key: cfg.key, email: cfg.email, lastSync: cfg.lastSync, error: cfg.error, pending: pending() } : null;
+    const info = () => cfg ? { url: cfg.url, key: cfg.key, email: cfg.email, lastSync: cfg.lastSync, error: cfg.error, pending: pending(), rawMissing: !!cfg.rawMissing, lastGarmin: cfg.lastGarmin || null } : null;
     return { run, soon, start, connect, disconnect, enabled, info };
   })();
 
@@ -1014,13 +1059,32 @@ td.num, th.num { text-align: right; }
     if (/hiit|cardio|yoga|pilates|mobil|athlet|stretch|dehn|functional|plyo|bootcamp/.test(t)) return 'athletics';
     return null;
   }
-  function autoPlanKey(date, sport, taken) {
+  // Garmin-Aktivität (Rohformat der Garmin-API) → Import-Zeile
+  function normGarmin(a) {
+    const when = String(a.startTimeLocal || a.startTimeGMT || a.activityDate || a.date || '');
+    const m = when.match(/(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?/); if (!m) return null;
+    const sec = Number(a.duration || a.elapsedDuration || a.movingDuration); if (!sec) return null;
+    const t = a.activityType, typeKey = String((t && typeof t === 'object' ? t.typeKey : t) || a.activityTypeKey || '');
+    const title = String(a.activityName || a.title || a.name || typeKey || 'Garmin-Aktivität');
+    const dist = Number(a.distance) || 0;
+    let rpe = Number(a.directWorkoutRpe || a.workoutRpe || a.rpe) || null; if (rpe && rpe > 10) rpe = rpe / 10;
+    const n = v => { const x = Number(v); return isFinite(x) && x > 0 ? x : null; };
+    return {
+      id: 'ga-' + String(a.activityId).replace(/[^0-9A-Za-z]/g, ''), date: m[1] + '-' + m[2] + '-' + m[3],
+      time: (m[4] || '00') + ':' + (m[5] || '00') + ':' + (m[6] || '00'),
+      sport: sportFor(typeKey) || sportFor(title), typeTxt: typeKey, title,
+      duration: Math.max(1, Math.round(sec / 60)), distanceKm: dist ? Math.round(dist / 10) / 100 : null,
+      avgHr: n(a.averageHR || a.averageHeartRate), maxHr: n(a.maxHR || a.maxHeartRate), ascent: n(a.elevationGain || a.totalAscent),
+      rpe: rpe && rpe >= 1 && rpe <= 10 ? Math.round(rpe) : null
+    };
+  }
+  function autoPlanKey(date, sport, taken, list) {
     const d = parseISO(date), ws = mondayOf(d), di = (d.getDay() + 6) % 7;
     const items = PLAN[di] || [];
     for (let slot = 0; slot < items.length; slot++) {
       const p = items[slot]; if (p.rest || p.sport !== sport) continue;
       const key = plannedKey(ws, di, slot);
-      if (taken.has(key) || sessions.some(s => s.plannedKey === key)) continue;
+      if (taken.has(key) || (list || sessions).some(s => !s.deleted && s.plannedKey === key)) continue;
       taken.add(key); return key;
     }
     return null;
@@ -1064,6 +1128,7 @@ td.num, th.num { text-align: right; }
     const acts = Array.isArray(obj) ? obj : (obj && Array.isArray(obj.activities) ? obj.activities : null);
     if (!acts) { err.textContent = 'Unbekanntes Dateiformat. Erwartet wird garmin-aktivitaeten.json aus dem Sync-Skript oder der CSV-Export aus Garmin Connect.'; err.hidden = false; renderImport(); return; }
     acts.forEach(a => {
+      if (a && a.activityId && (a.startTimeLocal || a.startTimeGMT || a.activityType)) { const g = normGarmin(a); if (g) importRows.push(g); return; } // Garmin-Rohformat
       if (!a || !a.date || !a.durationMin) return;
       const sport = sportFor(a.typeKey) || sportFor(a.title);
       const time = a.time || '';
@@ -1156,8 +1221,18 @@ td.num, th.num { text-align: right; }
   drop.addEventListener('drop', e => { e.preventDefault(); readFile(e.dataTransfer && e.dataTransfer.files[0]); });
 
   /* ---------- Sync-Oberfläche ---------- */
+  function renderAutoInfo(inf, on) {
+    const st = $('auto-state'), txt = $('auto-info'); if (!st) return;
+    const fmtT = t => { const d = new Date(t); return dm(d) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+    if (!on) { st.innerHTML = '<span class="chip warn">Noch nicht eingerichtet</span>'; txt.textContent = 'Richte zuerst die Synchronisierung ein (Verlauf → Synchronisierung). Danach einmalig garmin_setup.sh am Mac starten.'; return; }
+    if (inf.rawMissing) { st.innerHTML = '<span class="chip warn">Ein Schritt fehlt</span>'; txt.textContent = 'In Supabase fehlt die Garmin-Tabelle: Führe supabase-garmin.sql im SQL Editor aus.'; return; }
+    const lg = inf.lastGarmin;
+    if (lg) { st.innerHTML = '<span class="chip good">Aktiv</span>'; txt.textContent = 'Zuletzt übernommen ' + fmtT(lg.at) + ': ' + (lg.added ? lg.added + ' neu' : '') + (lg.added && lg.merged ? ', ' : '') + (lg.merged ? lg.merged + ' ergänzt' : '') + (inf.lastSync ? ' · geprüft ' + fmtT(inf.lastSync) : ''); return; }
+    st.innerHTML = '<span class="chip good">Bereit</span>'; txt.textContent = 'Sobald das Mac-Skript läuft, erscheinen neue Garmin-Aktivitäten hier automatisch.' + (inf.lastSync ? ' Zuletzt geprüft ' + fmtT(inf.lastSync) + '.' : '');
+  }
   function renderSyncUI() {
     const inf = Sync.info(), on = !!(inf && Sync.enabled());
+    renderAutoInfo(inf, on);
     const off = $('sync-off'), onBox = $('sync-on'); if (!off) return;
     off.hidden = on; onBox.hidden = !on;
     if (on) {
